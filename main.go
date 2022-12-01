@@ -5,15 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
+	"io"
 	"log"
-	"runtime/trace"
+	"os"
+	"os/signal"
+	"path"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
-type Input struct {
-	Data []Trade `json:"data"`
-	Type string  `json:"type"`
-}
+var (
+	symbols         []string      = []string{"BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:ADAUSDT"}
+	apiKey          string        = "ce4ecgaad3i3k9dfa8k0ce4ecgaad3i3k9dfa8kg"
+	windowSize      int           = 60
+	outputBuffer    int           = len(symbols) * windowSize
+	storagePath     string        = "./storage"
+	shutdownTimeout time.Duration = time.Second * 3
+)
 
 type Trade struct {
 	Price         float64 `json:"p"`
@@ -21,64 +31,9 @@ type Trade struct {
 	TimeMilliUNIX int64   `json:"t"`
 }
 
-func main() {
-	apiKey := ""
-
-	w, resp, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://ws.finnhub.io?token=%s", apiKey), nil)
-	if err != nil {
-		log.Panicln(err, resp)
-	}
-	defer w.Close()
-
-	symbols := []string{"BINANCE:BTCUSDT"} // , "BINANCE:ETHUSDT", "BINANCE:ADAUSDT"}
-	for _, s := range symbols {
-		msg, _ := json.Marshal(map[string]interface{}{"type": "subscribe", "symbol": s})
-
-		err = w.WriteMessage(websocket.TextMessage, msg)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	input := make(chan Trade)
-	output := make(chan Trade)
-
-	go Worker(60, input, output)
-
-	var msg Input
-
-	for {
-		time.Sleep(time.Millisecond * 500)
-		select {
-		case result := <-output:
-			log.Printf("--------------------------WORKER---%s : %f : %s---WORKER-----------------------", result.Symbol, result.Price, time.UnixMilli(result.TimeMilliUNIX).String())
-
-		default:
-			err := w.ReadJSON(&msg)
-			if err != nil {
-				panic(err)
-			}
-
-			//log.Printf("-----------------------------%s : %f : %s--------------------------", msg.Type, msg.Data[0].Price, time.UnixMilli(msg.Data[0].TimeMilliUNIX).String())
-			//log.Printf("Message from server: %+v\n", msg.Data)
-
-			av := msg.Parse()
-			for key, val := range av {
-				log.Printf("-----------------------------%s : %f : %s : %d--------------------------", key, val.Price, time.UnixMilli(val.TimeMilliUNIX).String(), len(av))
-			}
-
-			if average, consist := av["BINANCE:BTCUSDT"]; consist {
-				input <- average
-				log.Printf("\n-----------------------------%s : %f : %s--------------------------\n", average.Symbol, average.Price, time.UnixMilli(average.TimeMilliUNIX).String())
-			}
-		}
-	}
-
-	//_, message, err := w.ReadMessage()
-	//if err != nil {
-	//	panic(err)
-	//}
-	//fmt.Printf("%s", message)
+type Input struct {
+	Data []Trade `json:"data"`
+	Type string  `json:"type"`
 }
 
 // Parse Using for parse Input and make average from similar symbols.
@@ -102,9 +57,116 @@ func (in Input) Parse() map[string]Trade {
 	return separatedTrades
 }
 
+func init() {
+	if os.Getenv("SYMBOLS") != "" {
+		symbols = strings.Split(os.Getenv("SYMBOLS"), " ")
+	}
+
+	if os.Getenv("APIKEY") == "" {
+		log.Panicln("apiKey is required")
+	}
+
+	apiKey = os.Getenv("APIKEY")
+
+	if os.Getenv("storagePath") != "" {
+		storagePath = os.Getenv("storagePath")
+	}
+
+	if os.Getenv("WINDOW_SIZE") != "" {
+		windowSize, _ = strconv.Atoi(os.Getenv("WINDOW_SIZE"))
+	}
+
+	if os.Getenv("OUTPUT_BUFFER") != "" {
+		outputBuffer, _ = strconv.Atoi(os.Getenv("OUTPUT_BUFFER"))
+	}
+
+	if os.Getenv("SHUTDOWN_TIMEOUT") != "" {
+		duration, _ := strconv.Atoi(os.Getenv("SHUTDOWN_TIMEOUT"))
+		shutdownTimeout = time.Duration(duration)
+	}
+}
+
+func main() {
+	w, resp, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://ws.finnhub.io?token=%s", apiKey), nil)
+	if err != nil {
+		log.Panicln(err, resp)
+	}
+	defer w.Close()
+
+	for _, s := range symbols {
+		msg, _ := json.Marshal(map[string]interface{}{"type": "subscribe", "symbol": s})
+
+		err = w.WriteMessage(websocket.TextMessage, msg)
+		if err != nil {
+			log.Panicln(err)
+		}
+	}
+
+	symbolToWriter := make(map[string]io.Writer)
+	for _, symbol := range symbols {
+		f, err := os.Create(path.Join(storagePath, symbol+".json.out"))
+		if err != nil {
+			log.Panicln(err)
+		}
+
+		symbolToWriter[symbol] = f
+	}
+
+	ctx, cancelFn := context.WithTimeout(context.Background(), shutdownTimeout)
+
+	symbolToWorkerInput := make(map[string]chan Trade)
+	workersOutput := make(chan Trade, outputBuffer)
+
+	for _, pair := range symbols {
+		symbolToWorkerInput[pair] = make(chan Trade, windowSize)
+		go Worker(ctx, windowSize, symbolToWorkerInput[pair], workersOutput)
+	}
+
+	go Listen(ctx, w, symbolToWorkerInput)
+	go Storage(ctx, workersOutput, symbolToWriter)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+	cancelFn()
+	w.Close()
+}
+
+// Listen using for listen websocket.Conn and write workers inputs.
+func Listen(ctx context.Context, w *websocket.Conn, pairToWorkerInput map[string]chan Trade) {
+	defer func() {
+		for _, ch := range pairToWorkerInput {
+			close(ch)
+		}
+	}()
+
+	var input Input
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		default:
+			err := w.ReadJSON(&input)
+			if err != nil {
+				log.Panicln(err)
+			}
+
+			trades := input.Parse()
+			for pair, trade := range trades {
+				//log.Printf("-----------------------------%s : %f : %s : %d--------------------------", pair, trade.Price, time.UnixMilli(trade.TimeMilliUNIX).String(), len(trades))
+				pairToWorkerInput[pair] <- trade
+			}
+		}
+
+	}
+}
+
 // Worker need for make moving average.
-func Worker(windowSize int, in <-chan Trade, out chan<- Trade) {
-	trace.NewTask(context.Background(), "WORKER")
+func Worker(ctx context.Context, windowSize int, in <-chan Trade, out chan<- Trade) {
+	defer close(out)
+
 	window := make([]Trade, 0, windowSize)
 	average := Trade{}
 
@@ -135,7 +197,13 @@ func Worker(windowSize int, in <-chan Trade, out chan<- Trade) {
 	}
 }
 
-// 15 + 10 + 45 + 100 + 30 = 200 / 5 = 40 old
-// 20 + 10 + 45 + 100 + 30 = 205 / 5 = 41 new
-// delta = 20 - 15
-// windowDelta = delta / windowSize =  5 / 5 = 1
+func Storage(ctx context.Context, in <-chan Trade, symbolToWriter map[string]io.Writer) {
+	encoders := make(map[string]*json.Encoder)
+	for pair, w := range symbolToWriter {
+		encoders[pair] = json.NewEncoder(w)
+	}
+
+	for average := range in {
+		encoders[average.Symbol].Encode(average)
+	}
+}

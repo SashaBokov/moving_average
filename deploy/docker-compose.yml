@@ -1,0 +1,18 @@
+version: "3"
+
+services:
+  app:
+    container_name: fun-with-channels
+    build:
+      context: ${PROJECT_PATH} # PROJECT_PATH is full path to project directory, required
+      dockerfile: ${PROJECT_PATH}/deploy/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ${PROJECT_STORAGE_PATH}:/app/storage
+    environment:
+      - SYMBOLS=${SYMBOLS}
+      - APIKEY=${APIKEY} #reqired
+      - WINDOW_SIZE=${WINDOW_SIZE}
+      - OUTPUT_BUFFER=${OUTPUT_BUFFER}
+      - SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT}
+
