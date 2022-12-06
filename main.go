@@ -18,7 +18,7 @@ import (
 
 var (
 	symbols         []string      = []string{"BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:ADAUSDT"}
-	apiKey          string        = "ce4ecgaad3i3k9dfa8k0ce4ecgaad3i3k9dfa8kg"
+	apiKey          string        = ""
 	windowSize      int           = 60
 	outputBuffer    int           = len(symbols) * windowSize
 	storagePath     string        = "./storage"
@@ -68,10 +68,6 @@ func init() {
 
 	apiKey = os.Getenv("APIKEY")
 
-	if os.Getenv("storagePath") != "" {
-		storagePath = os.Getenv("storagePath")
-	}
-
 	if os.Getenv("WINDOW_SIZE") != "" {
 		windowSize, _ = strconv.Atoi(os.Getenv("WINDOW_SIZE"))
 	}
@@ -89,7 +85,7 @@ func init() {
 func main() {
 	w, resp, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://ws.finnhub.io?token=%s", apiKey), nil)
 	if err != nil {
-		log.Panicln(err, resp)
+		log.Panicf("%s, %v", err, resp)
 	}
 	defer w.Close()
 
@@ -164,9 +160,7 @@ func Listen(ctx context.Context, w *websocket.Conn, pairToWorkerInput map[string
 }
 
 // Worker need for make moving average.
-func Worker(ctx context.Context, windowSize int, in <-chan Trade, out chan<- Trade) {
-	defer close(out)
-
+func Worker(_ context.Context, windowSize int, in <-chan Trade, out chan<- Trade) {
 	window := make([]Trade, 0, windowSize)
 	average := Trade{}
 
@@ -197,13 +191,16 @@ func Worker(ctx context.Context, windowSize int, in <-chan Trade, out chan<- Tra
 	}
 }
 
-func Storage(ctx context.Context, in <-chan Trade, symbolToWriter map[string]io.Writer) {
+// Storage simple storage emulation.
+func Storage(_ context.Context, in <-chan Trade, symbolToWriter map[string]io.Writer) {
 	encoders := make(map[string]*json.Encoder)
 	for pair, w := range symbolToWriter {
 		encoders[pair] = json.NewEncoder(w)
 	}
 
 	for average := range in {
-		encoders[average.Symbol].Encode(average)
+		if err := encoders[average.Symbol].Encode(average); err != nil {
+			log.Println(err)
+		}
 	}
 }

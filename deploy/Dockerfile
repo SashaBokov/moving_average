@@ -3,7 +3,7 @@ FROM golang:1.17.11-alpine3.16 as builder
 # Changing root directory
 WORKDIR /app
 # Copy all files to root directory
-COPY .. .
+COPY . .
 # Collect and download dependances
 RUN go mod download
 # Building application
